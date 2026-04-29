@@ -1,684 +1,378 @@
 """
-app.py — SME IPO Performance Tracker
-=====================================
-Tracks NSE Emerge + BSE SME IPOs: performance since listing, real-time prices,
-upcoming corporate events, and fresh issue vs OFS breakdown.
-
-Run:  streamlit run app.py
+IPO Performance Tracker
+========================
+Tracks Mainboard + SME IPO performance with live prices from yfinance.
+Data source: data/ipos.csv (seeded from your Excel, symbols auto-mapped to NSE)
 """
 
+import warnings
+warnings.filterwarnings("ignore")
+
 import time
-import threading
-import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 
 import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
+import yfinance as yf
 import streamlit as st
-
-import database as db
-import scraper
-import price_fetcher
-
-# ── Logging ───────────────────────────────────────────────────────────────────
-logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(name)s | %(message)s")
-logger = logging.getLogger(__name__)
+import plotly.express as px
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="SME IPO Tracker",
+    page_title="IPO Tracker",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ── Custom CSS ────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-/* Tighten dataframe cells */
-[data-testid="stDataFrame"] td { font-size: 13px !important; }
-[data-testid="stDataFrame"] th { font-size: 13px !important; font-weight: 700; }
-
-/* Metric cards */
 [data-testid="metric-container"] {
-    background: #1e2130;
-    border-radius: 10px;
-    padding: 12px 16px;
-    border: 1px solid #2e3250;
+    background: #1e2130; border-radius: 10px;
+    padding: 10px 16px; border: 1px solid #2e3250;
 }
-
-/* Positive / negative badges used inside HTML tables */
-.gain  { color: #00c853; font-weight: 600; }
-.loss  { color: #ff1744; font-weight: 600; }
-.badge-fresh { background:#1565c0; color:#fff; padding:2px 7px; border-radius:4px; font-size:11px; }
-.badge-ofs   { background:#6a1b9a; color:#fff; padding:2px 7px; border-radius:4px; font-size:11px; }
-.badge-mixed { background:#e65100; color:#fff; padding:2px 7px; border-radius:4px; font-size:11px; }
-.badge-na    { background:#37474f; color:#ccc; padding:2px 7px; border-radius:4px; font-size:11px; }
-
 div[data-testid="stSidebarContent"] { background: #131625; }
 </style>
 """, unsafe_allow_html=True)
 
+# ── Constants ─────────────────────────────────────────────────────────────────
+DATA_FILE      = "data/ipos.csv"
+REFRESH_SECS   = 300   # 5 minutes
 
-# ── DB init (once per process) ────────────────────────────────────────────────
-db.init_db()
-
-
-# ── Session-state keys ────────────────────────────────────────────────────────
-def _init_state():
-    defaults = {
-        "initial_scrape_done": False,
-        "prices_fetched_at":   None,
-        "events_fetched_at":   None,
-        "scrape_log":          [],
-        "refresh_counter":     0,
-    }
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
-
-_init_state()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Data loading helpers (cached)
-# ─────────────────────────────────────────────────────────────────────────────
-
-@st.cache_data(ttl=300, show_spinner=False)   # 5-min cache for price data
-def _load_combined() -> pd.DataFrame:
-    """
-    Join the ipos table with the price_cache table and compute all derived columns.
-    """
-    ipos   = db.get_all_ipos()
-    prices = db.get_price_cache()
-
-    if ipos.empty:
-        return pd.DataFrame()
-
-    # Build a lookup: (exchange, symbol) -> price row
-    price_map = {}
-    for _, pr in prices.iterrows():
-        key = (pr["exchange"], pr["symbol"])
-        price_map[key] = pr
-
-    records = []
-    for _, row in ipos.iterrows():
-        sym = row.get("nse_symbol") or row.get("bse_code") or ""
-        exch = row["exchange"]
-        pkey = (exch, sym)
-        pr   = price_map.get(pkey, {})
-
-        issue_price   = row.get("issue_price")
-        listing_price = row.get("listing_price")
-        current_price = pr.get("current_price") if pr else None
-
-        listing_gain = (
-            round((listing_price - issue_price) / issue_price * 100, 2)
-            if issue_price and listing_price and issue_price > 0
-            else None
-        )
-        current_gain = (
-            round((current_price - issue_price) / issue_price * 100, 2)
-            if issue_price and current_price and issue_price > 0
-            else None
-        )
-
-        it = row.get("issue_type") or ""
-        if "fresh" in it.lower() and "ofs" in it.lower():
-            issue_badge = "Mixed"
-        elif "fresh" in it.lower():
-            issue_badge = "Fresh Issue"
-        elif "ofs" in it.lower() or "offer" in it.lower():
-            issue_badge = "OFS"
-        else:
-            issue_badge = "—"
-
-        records.append({
-            "Company":            row["company_name"],
-            "Exchange":           exch,
-            "Symbol":             sym,
-            "Listing Date":       row.get("listing_date"),
-            "Issue Price (₹)":   issue_price,
-            "Listing Price (₹)": listing_price,
-            "CMP (₹)":           current_price,
-            "Listing Gain %":    listing_gain,
-            "Total Gain %":      current_gain,
-            "52W High (₹)":     pr.get("week52_high") if pr else None,
-            "52W Low (₹)":      pr.get("week52_low")  if pr else None,
-            "Day Chg %":         pr.get("day_change_pct") if pr else None,
-            "Issue Type":         issue_badge,
-            "Fresh Issue Size":   row.get("fresh_issue_size"),
-            "OFS Size":           row.get("ofs_size"),
-            "Total Issue Size":   row.get("total_issue_size"),
-            "Prices Last Updated": pr.get("fetched_at") if pr else None,
-            "detail_url":         row.get("detail_url"),
-        })
-
-    df = pd.DataFrame(records)
-    if not df.empty and "Listing Date" in df.columns:
-        df["Listing Date"] = pd.to_datetime(df["Listing Date"], errors="coerce")
-        df = df.sort_values("Listing Date", ascending=False).reset_index(drop=True)
+# ── Load base data (fast — just a CSV read) ───────────────────────────────────
+@st.cache_data(show_spinner=False)
+def load_base() -> pd.DataFrame:
+    df = pd.read_csv(DATA_FILE)
+    df["Listing Date"] = pd.to_datetime(df["Listing Date"], errors="coerce")
+    df["Issue Price"]        = pd.to_numeric(df["Issue Price"],        errors="coerce")
+    df["Listing Day Close"]  = pd.to_numeric(df["Listing Day Close"],  errors="coerce")
+    df["Listing Day Gain"]   = pd.to_numeric(df["Listing Day Gain"],   errors="coerce")
     return df
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def _load_events() -> pd.DataFrame:
-    return db.get_upcoming_events(days_ahead=60)
+# ── Fetch live prices from yfinance ──────────────────────────────────────────
+@st.cache_data(ttl=REFRESH_SECS, show_spinner=False)
+def fetch_prices(symbols: tuple) -> dict:
+    """
+    Returns {symbol: {price, prev_close, pct_change, week52_high, week52_low}}
+    Batch-downloads via yfinance for speed.
+    """
+    valid = [s for s in symbols if s]
+    if not valid:
+        return {}
 
+    tickers = [f"{s}.NS" for s in valid]
+    prices  = {}
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Background workers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _run_initial_scrape(status_placeholder):
-    """Full scrape of both list pages + detail pages for new entries."""
-    logs = []
-
-    def log(msg):
-        logs.append(msg)
-        st.session_state["scrape_log"] = logs[-10:]
-
-    log("📡 Fetching NSE Emerge IPO list …")
-    n_nse = scraper.scrape_list_page("NSE")
-    log(f"   ✅ NSE: {n_nse} records saved")
-
-    log("📡 Fetching BSE SME IPO list …")
-    n_bse = scraper.scrape_list_page("BSE")
-    log(f"   ✅ BSE: {n_bse} records saved")
-
-    pending = db.get_unscraped_details(limit=500)
-    total_pending = len(pending)
-    log(f"🔍 Fetching detail pages for {total_pending} IPOs (issue type, symbol) …")
-
-    def detail_progress(done, total, name):
-        log(f"   [{done}/{total}] {name}")
-
-    scraper.scrape_pending_details(batch_size=500, progress_cb=detail_progress)
-    log("✅ Detail scrape complete")
-
-    log("💹 Fetching live prices …")
-    n_prices = price_fetcher.refresh_all_prices()
-    log(f"   ✅ {n_prices} prices updated")
-    st.session_state["prices_fetched_at"] = datetime.now()
-
-    log("📅 Fetching upcoming events …")
-    symbols = db.get_symbols_for_price_update()
-    price_fetcher.refresh_events(symbols)
-    st.session_state["events_fetched_at"] = datetime.now()
-
-    st.session_state["initial_scrape_done"] = True
-    _load_combined.clear()
-    _load_events.clear()
-    log("🎉 All done! Dashboard is ready.")
-
-
-def _background_price_refresh():
-    """Refresh prices silently in background; called from auto-refresh tick."""
     try:
-        price_fetcher.refresh_all_prices()
-        st.session_state["prices_fetched_at"] = datetime.now()
-        scraper.refresh_new_ipos()   # pick up any brand-new IPOs
-        _load_combined.clear()
-        _load_events.clear()
+        data = yf.download(
+            tickers,
+            period="1y",
+            interval="1d",
+            group_by="ticker",
+            auto_adjust=True,
+            progress=False,
+            threads=True,
+        )
+
+        for sym, ticker in zip(valid, tickers):
+            try:
+                if len(valid) == 1:
+                    # Single ticker — yfinance returns flat DataFrame
+                    close = data["Close"].dropna()
+                else:
+                    close = data[ticker]["Close"].dropna()
+
+                if len(close) < 2:
+                    continue
+
+                cur       = float(close.iloc[-1])
+                prev      = float(close.iloc[-2])
+                pct_chg   = round((cur - prev) / prev * 100, 2) if prev else None
+                high_52w  = float(close.tail(252).max())
+                low_52w   = float(close.tail(252).min())
+
+                prices[sym] = {
+                    "price":       round(cur, 2),
+                    "prev_close":  round(prev, 2),
+                    "pct_change":  pct_chg,
+                    "week52_high": round(high_52w, 2),
+                    "week52_low":  round(low_52w, 2),
+                }
+            except Exception:
+                continue
     except Exception as e:
-        logger.warning(f"Background refresh error: {e}")
+        st.warning(f"Price fetch warning: {e}")
+
+    return prices
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Formatting helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Build display DataFrame ───────────────────────────────────────────────────
+def build_display(base: pd.DataFrame, prices: dict) -> pd.DataFrame:
+    rows = []
+    for _, r in base.iterrows():
+        sym          = r.get("NSE Symbol", "")
+        issue_price  = r.get("Issue Price")
+        list_close   = r.get("Listing Day Close")
+        list_gain    = r.get("Listing Day Gain")
+        pr           = prices.get(sym, {}) if sym else {}
+        cur_price    = pr.get("price")
 
-def _pct_badge(val):
-    if val is None:
+        total_gain = (
+            round((cur_price - issue_price) / issue_price * 100, 2)
+            if issue_price and cur_price and issue_price > 0
+            else None
+        )
+
+        rows.append({
+            "Company":          r["Company Name"],
+            "Type":             r.get("Sheet", ""),
+            "Business":         r.get("Business", ""),
+            "Listed":           r["Listing Date"],
+            "Issue ₹":          issue_price,
+            "List Close ₹":    list_close,
+            "List Gain %":     list_gain,
+            "CMP ₹":           cur_price,
+            "Total Gain %":    total_gain,
+            "Day Chg %":       pr.get("pct_change"),
+            "52W High ₹":     pr.get("week52_high"),
+            "52W Low ₹":      pr.get("week52_low"),
+            "Symbol":          sym,
+        })
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values("Listed", ascending=False, na_position="last")
+    return df.reset_index(drop=True)
+
+
+# ── Formatting helpers ────────────────────────────────────────────────────────
+def fmt_pct(v):
+    if v is None or (isinstance(v, float) and pd.isna(v)):
         return "—"
-    color = "#00c853" if val >= 0 else "#ff1744"
-    arrow = "▲" if val >= 0 else "▼"
-    return f'<span style="color:{color};font-weight:600">{arrow} {val:+.2f}%</span>'
+    arrow = "▲" if v >= 0 else "▼"
+    return f"{arrow} {v:+.2f}%"
 
-
-def _issue_badge(it: str) -> str:
-    if it == "Fresh Issue":
-        return '<span class="badge-fresh">Fresh Issue</span>'
-    elif it == "OFS":
-        return '<span class="badge-ofs">OFS</span>'
-    elif it == "Mixed":
-        return '<span class="badge-mixed">Mixed</span>'
-    return '<span class="badge-na">—</span>'
-
-
-def _fmt_price(val):
-    if val is None:
+def fmt_price(v):
+    if v is None or (isinstance(v, float) and pd.isna(v)):
         return "—"
-    return f"₹{val:,.2f}"
+    return f"₹{v:,.2f}"
+
+def color_pct(v):
+    """Return CSS color string for a percentage value."""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return ""
+    return "color: #00c853; font-weight:600" if v >= 0 else "color: #ff1744; font-weight:600"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Sidebar
-# ─────────────────────────────────────────────────────────────────────────────
-
-def render_sidebar():
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+def sidebar():
     with st.sidebar:
-        st.title("⚙️ Filters & Controls")
-        st.markdown("---")
+        st.title("⚙️ Filters")
 
-        exchange_filter = st.multiselect(
-            "Exchange", ["NSE", "BSE"], default=["NSE", "BSE"]
+        ipo_type = st.multiselect(
+            "IPO Type", ["Mainboard", "SME"], default=["Mainboard", "SME"]
         )
 
-        date_options = {
-            "Last 6 months":  (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d"),
-            "Last 1 year":    (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d"),
-            "Last 2 years":   (datetime.now() - timedelta(days=730)).strftime("%Y-%m-%d"),
-            "Last 3 years":   (datetime.now() - timedelta(days=1095)).strftime("%Y-%m-%d"),
-            "All time":       "2000-01-01",
+        date_opts = {
+            "Last 6 months":  180,
+            "Last 1 year":    365,
+            "Last 2 years":   730,
+            "Last 3 years":   1095,
+            "All":            9999,
         }
-        date_label = st.selectbox("Listed Since", list(date_options.keys()), index=2)
-        min_date = date_options[date_label]
+        date_sel = st.selectbox("Listed Since", list(date_opts.keys()), index=1)
+        days_back = date_opts[date_sel]
 
-        issue_type_filter = st.multiselect(
-            "Issue Type",
-            ["Fresh Issue", "OFS", "Mixed", "—"],
-            default=["Fresh Issue", "OFS", "Mixed", "—"],
-        )
-
-        sort_by = st.selectbox(
-            "Sort by",
-            ["Listing Date ↓", "Total Gain % ↓", "Total Gain % ↑", "Listing Gain % ↓"],
-        )
+        sort_opts = {
+            "Listed (newest first)":   ("Listed",       False),
+            "Total Gain % ↓ (best)":  ("Total Gain %", False),
+            "Total Gain % ↑ (worst)": ("Total Gain %", True),
+            "List Gain % ↓":          ("List Gain %",  False),
+        }
+        sort_sel  = st.selectbox("Sort by", list(sort_opts.keys()))
+        sort_col, sort_asc = sort_opts[sort_sel]
 
         st.markdown("---")
-        auto_refresh = st.toggle("Auto-refresh prices (5 min)", value=True)
-
-        st.markdown("---")
-        st.markdown("### 🔄 Manual Refresh")
-        if st.button("Refresh Prices Now", use_container_width=True):
-            with st.spinner("Fetching live prices …"):
-                price_fetcher.refresh_all_prices()
-                st.session_state["prices_fetched_at"] = datetime.now()
-                _load_combined.clear()
-            st.success("Prices updated!")
-
-        if st.button("Rescan for New IPOs", use_container_width=True):
-            with st.spinner("Scanning Chittorgarh for new listings …"):
-                added = scraper.refresh_new_ipos()
-                scraper.scrape_pending_details(batch_size=50)
-                _load_combined.clear()
-            st.success(f"Scan done. {added} new entries found.")
-
-        last = st.session_state.get("prices_fetched_at")
-        if last:
-            elapsed = int((datetime.now() - last).total_seconds() / 60)
-            st.caption(f"Prices last refreshed: {elapsed} min ago")
-
-    return {
-        "exchanges":    exchange_filter,
-        "min_date":     min_date,
-        "issue_types":  issue_type_filter,
-        "sort_by":      sort_by,
-        "auto_refresh": auto_refresh,
-    }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main dashboard tabs
-# ─────────────────────────────────────────────────────────────────────────────
-
-def render_dashboard(df: pd.DataFrame, filters: dict):
-    # Guard: if df has no columns (DB empty / cold start), show setup prompt
-    if df.empty or "Exchange" not in df.columns:
-        st.info(
-            "📭 No data loaded yet.\n\n"
-            "Click **'Start Loading Data'** in the sidebar to scrape IPO data "
-            "and fetch live prices. This takes ~5–10 minutes the first time."
-        )
-        if st.button("🚀 Start Loading Data", type="primary"):
-            st.session_state["initial_scrape_done"] = False
+        st.caption("Prices refresh automatically every 5 min.\nYou can also force-refresh:")
+        if st.button("🔄 Refresh Prices Now", use_container_width=True):
+            fetch_prices.clear()
             st.rerun()
-        return
+
+    return ipo_type, days_back, sort_col, sort_asc
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+def main():
+    ipo_type, days_back, sort_col, sort_asc = sidebar()
+
+    st.title("📈 IPO Performance Tracker")
+    st.caption(
+        "Mainboard + SME IPOs | Live prices via NSE (yfinance) | "
+        f"Auto-refreshes every 5 min | {datetime.now().strftime('%d %b %Y %H:%M')}"
+    )
+
+    # ── Load + price ─────────────────────────────────────────────────────────
+    base   = load_base()
+    syms   = tuple(base["NSE Symbol"].dropna().unique().tolist())
+
+    with st.spinner("Fetching live prices from NSE…"):
+        prices = fetch_prices(syms)
+
+    df = build_display(base, prices)
 
     # ── Apply filters ─────────────────────────────────────────────────────────
-    if filters["exchanges"]:
-        df = df[df["Exchange"].isin(filters["exchanges"])]
+    if ipo_type:
+        df = df[df["Type"].isin(ipo_type)]
 
-    if filters["min_date"] and "Listing Date" in df.columns:
-        df = df[df["Listing Date"] >= pd.Timestamp(filters["min_date"])]
+    cutoff = pd.Timestamp.now() - pd.Timedelta(days=days_back)
+    df = df[df["Listed"].isna() | (df["Listed"] >= cutoff)]
 
-    if filters["issue_types"]:
-        df = df[df["Issue Type"].isin(filters["issue_types"])]
-
-    sort_map = {
-        "Listing Date ↓":   ("Listing Date",   False),
-        "Total Gain % ↓":   ("Total Gain %",   False),
-        "Total Gain % ↑":   ("Total Gain %",   True),
-        "Listing Gain % ↓": ("Listing Gain %", False),
-    }
-    scol, sasc = sort_map.get(filters["sort_by"], ("Listing Date", False))
-    if scol in df.columns:
-        df = df.sort_values(scol, ascending=sasc, na_position="last").reset_index(drop=True)
+    if sort_col in df.columns:
+        df = df.sort_values(sort_col, ascending=sort_asc, na_position="last")
 
     # ── KPI cards ─────────────────────────────────────────────────────────────
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Total IPOs Tracked", len(df))
-
-    priced = df[df["CMP (₹)"].notna()]
+    priced = df[df["Total Gain %"].notna()]
     gainers = priced[priced["Total Gain %"] >= 0]
-    losers  = priced[priced["Total Gain %"] < 0]
-    c2.metric("Gainers 🟢", len(gainers))
-    c3.metric("Losers 🔴",  len(losers))
+    losers  = priced[priced["Total Gain %"] <  0]
+    avg_tot = priced["Total Gain %"].mean() if not priced.empty else None
+    avg_lst = df["List Gain %"].dropna().mean()
 
-    avg_gain = priced["Total Gain %"].mean() if not priced.empty else None
-    c4.metric("Avg Total Gain", f"{avg_gain:+.1f}%" if avg_gain is not None else "—")
-
-    avg_list = df["Listing Gain %"].mean() if not df.empty else None
-    c5.metric("Avg Listing Gain", f"{avg_list:+.1f}%" if avg_list is not None else "—")
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("Total IPOs",      len(df))
+    c2.metric("🟢 Gainers",       len(gainers))
+    c3.metric("🔴 Losers",        len(losers))
+    c4.metric("Avg Total Gain",  f"{avg_tot:+.1f}%" if avg_tot is not None else "—")
+    c5.metric("Avg Listing Gain", f"{avg_lst:+.1f}%" if pd.notna(avg_lst) else "—")
 
     st.markdown("---")
 
     # ── Tabs ──────────────────────────────────────────────────────────────────
-    tab_main, tab_chart, tab_events, tab_detail = st.tabs([
-        "📋 IPO Performance Table",
-        "📊 Charts",
-        "📅 Upcoming Events",
-        "🔬 Company Detail",
+    tab_table, tab_charts, tab_detail = st.tabs([
+        "📋 Performance Table", "📊 Charts", "🔍 Company Detail"
     ])
 
-    # ─ Tab 1: Main table ───────────────────────────────────────────────────────
-    with tab_main:
+    # ── Tab 1: Table ──────────────────────────────────────────────────────────
+    with tab_table:
         st.caption(
             f"Showing {len(df)} IPOs | "
-            f"CMP from NSE/BSE public APIs | "
-            f"Prices auto-refresh every 5 minutes"
+            f"Live prices for {len(priced)} companies | "
+            f"{len(df) - len(priced)} without symbol match yet"
         )
 
-        if df.empty:
-            st.info("No data yet. Data is loading in the background — please wait a moment.")
+        # Build styled display table
+        disp = df[[
+            "Company","Type","Listed","Issue ₹","List Close ₹",
+            "List Gain %","CMP ₹","Total Gain %","Day Chg %",
+            "52W High ₹","52W Low ₹","Symbol","Business"
+        ]].copy()
+
+        disp["Listed"]       = disp["Listed"].dt.strftime("%d %b %Y").fillna("—")
+        disp["Issue ₹"]      = disp["Issue ₹"].apply(fmt_price)
+        disp["List Close ₹"] = disp["List Close ₹"].apply(fmt_price)
+        disp["CMP ₹"]        = disp["CMP ₹"].apply(fmt_price)
+        disp["52W High ₹"]   = disp["52W High ₹"].apply(fmt_price)
+        disp["52W Low ₹"]    = disp["52W Low ₹"].apply(fmt_price)
+        disp["List Gain %"]  = disp["List Gain %"].apply(fmt_pct)
+        disp["Total Gain %"] = disp["Total Gain %"].apply(fmt_pct)
+        disp["Day Chg %"]    = disp["Day Chg %"].apply(fmt_pct)
+        disp["Business"]     = disp["Business"].fillna("").str[:120]
+
+        st.dataframe(disp, use_container_width=True, height=620, hide_index=True)
+
+        csv = df.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Download CSV", csv, "ipo_tracker.csv", "text/csv")
+
+    # ── Tab 2: Charts ─────────────────────────────────────────────────────────
+    with tab_charts:
+        if priced.empty:
+            st.info("No price data yet — charts will appear once prices load.")
         else:
-            # Build display table with coloured % columns
-            display_df = df[[
-                "Company", "Exchange", "Symbol", "Listing Date",
-                "Issue Price (₹)", "Listing Price (₹)", "CMP (₹)",
-                "Listing Gain %", "Total Gain %", "Day Chg %",
-                "52W High (₹)", "52W Low (₹)",
-                "Issue Type", "Fresh Issue Size", "OFS Size", "Total Issue Size",
-                "Prices Last Updated",
-            ]].copy()
+            col1, col2 = st.columns(2)
 
-            display_df["Listing Date"] = display_df["Listing Date"].dt.strftime("%d %b %Y").fillna("—")
-
-            # Color-code numeric %% columns with Streamlit's built-in gradient
-            def _pct_fmt(v):
-                if pd.isna(v):
-                    return "—"
-                return f"{v:+.2f}%"
-
-            display_df["Listing Gain %"] = display_df["Listing Gain %"].apply(_pct_fmt)
-            display_df["Total Gain %"]   = display_df["Total Gain %"].apply(_pct_fmt)
-            display_df["Day Chg %"]      = display_df["Day Chg %"].apply(_pct_fmt)
-            display_df["Issue Price (₹)"]   = display_df["Issue Price (₹)"].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "—")
-            display_df["Listing Price (₹)"] = display_df["Listing Price (₹)"].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "—")
-            display_df["CMP (₹)"]           = display_df["CMP (₹)"].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "—")
-            display_df["52W High (₹)"]      = display_df["52W High (₹)"].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "—")
-            display_df["52W Low (₹)"]       = display_df["52W Low (₹)"].apply(lambda x: f"₹{x:,.2f}" if pd.notna(x) else "—")
-            display_df["Prices Last Updated"] = display_df["Prices Last Updated"].fillna("—")
-            for col in ["Fresh Issue Size", "OFS Size", "Total Issue Size"]:
-                display_df[col] = display_df[col].fillna("—")
-
-            st.dataframe(
-                display_df,
-                use_container_width=True,
-                height=620,
-                hide_index=True,
-            )
-
-            # Download button
-            csv = df.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                "⬇️ Download as CSV",
-                csv,
-                "sme_ipo_tracker.csv",
-                "text/csv",
-                use_container_width=False,
-            )
-
-    # ─ Tab 2: Charts ───────────────────────────────────────────────────────────
-    with tab_chart:
-        priced2 = df[df["Total Gain %"].notna()].copy()
-
-        if priced2.empty:
-            st.info("Price data is loading — charts will appear once prices are fetched.")
-        else:
-            # Ensure numeric for plotting (strip any % formatting already applied)
-            for _col in ["Total Gain %", "Listing Gain %"]:
-                priced2[_col] = pd.to_numeric(
-                    priced2[_col].astype(str)
-                        .str.replace("%", "", regex=False)
-                        .str.replace("+", "", regex=False)
-                        .str.replace("—", "", regex=False),
-                    errors="coerce",
-                )
-
-            ch1, ch2 = st.columns(2)
-
-            with ch1:
+            with col1:
                 st.subheader("Total Return Distribution")
                 fig = px.histogram(
-                    priced2, x="Total Gain %", nbins=40,
-                    color_discrete_sequence=["#1f77b4"],
-                    labels={"Total Gain %": "Total Return from Issue Price (%)"},
+                    priced, x="Total Gain %", nbins=40,
+                    color="Type",
+                    color_discrete_map={"Mainboard": "#1f77b4", "SME": "#ff7f0e"},
+                    barmode="overlay", opacity=0.75,
                 )
-                fig.update_layout(
-                    paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
-                    font_color="white", margin=dict(t=30, b=10),
-                )
-                fig.add_vline(x=0, line_dash="dash", line_color="white", opacity=0.4)
+                fig.add_vline(x=0, line_dash="dash", line_color="white", opacity=0.5)
+                fig.update_layout(paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
+                                  font_color="white", margin=dict(t=30,b=10))
                 st.plotly_chart(fig, use_container_width=True)
 
-            with ch2:
-                st.subheader("Listing Gain vs Total Gain (by Issue Type)")
+            with col2:
+                st.subheader("Listing Gain vs Total Gain")
                 fig2 = px.scatter(
-                    priced2.dropna(subset=["Listing Gain %", "Total Gain %"]),
-                    x="Listing Gain %", y="Total Gain %",
-                    color="Issue Type", hover_name="Company",
-                    color_discrete_map={
-                        "Fresh Issue": "#1565c0",
-                        "OFS":         "#6a1b9a",
-                        "Mixed":       "#e65100",
-                        "—":           "#546e7a",
-                    },
+                    priced.dropna(subset=["List Gain %", "Total Gain %"]),
+                    x="List Gain %", y="Total Gain %",
+                    color="Type", hover_name="Company",
+                    color_discrete_map={"Mainboard": "#1f77b4", "SME": "#ff7f0e"},
                 )
                 fig2.add_hline(y=0, line_dash="dash", line_color="white", opacity=0.3)
                 fig2.add_vline(x=0, line_dash="dash", line_color="white", opacity=0.3)
-                fig2.update_layout(
-                    paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
-                    font_color="white", margin=dict(t=30, b=10),
-                )
+                fig2.update_layout(paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
+                                   font_color="white", margin=dict(t=30,b=10))
                 st.plotly_chart(fig2, use_container_width=True)
 
-            st.subheader("Top 20 Gainers & Losers (Total Return from Issue Price)")
-            top20 = pd.concat([
-                priced2.nlargest(10, "Total Gain %"),
-                priced2.nsmallest(10, "Total Gain %"),
-            ]).drop_duplicates()
+            st.subheader("Top 15 Gainers & 15 Losers  (Total Return from Issue Price)")
+            top = pd.concat([
+                priced.nlargest(15, "Total Gain %"),
+                priced.nsmallest(15, "Total Gain %"),
+            ]).drop_duplicates().sort_values("Total Gain %")
 
             fig3 = px.bar(
-                top20.sort_values("Total Gain %"),
-                x="Total Gain %", y="Company",
-                orientation="h",
+                top, x="Total Gain %", y="Company", orientation="h",
                 color="Total Gain %",
-                color_continuous_scale=["#ff1744", "#b71c1c", "#1b5e20", "#00c853"],
+                color_continuous_scale=["#ff1744","#b71c1c","#1b5e20","#00c853"],
                 color_continuous_midpoint=0,
-                hover_data=["Exchange", "Listing Date", "Issue Type"],
+                hover_data=["Type","Listed","Issue ₹"],
                 text="Total Gain %",
             )
             fig3.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
             fig3.update_layout(
                 paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
-                font_color="white", height=600,
-                margin=dict(t=20, b=10), showlegend=False,
+                font_color="white", height=700,
+                margin=dict(t=20,b=10), showlegend=False,
                 coloraxis_showscale=False,
             )
             st.plotly_chart(fig3, use_container_width=True)
 
-            # Exchange breakdown pie
-            col_a, col_b = st.columns(2)
-            with col_a:
-                st.subheader("IPOs by Exchange")
-                exc_counts = df["Exchange"].value_counts().reset_index()
-                exc_counts.columns = ["Exchange", "Count"]
-                fig4 = px.pie(exc_counts, names="Exchange", values="Count",
-                              color_discrete_sequence=["#1f77b4","#ff7f0e"])
-                fig4.update_layout(paper_bgcolor="#0e1117", font_color="white", margin=dict(t=20))
-                st.plotly_chart(fig4, use_container_width=True)
-
-            with col_b:
-                st.subheader("IPOs by Issue Type")
-                it_counts = df["Issue Type"].value_counts().reset_index()
-                it_counts.columns = ["Issue Type", "Count"]
-                fig5 = px.pie(it_counts, names="Issue Type", values="Count",
-                              color_discrete_sequence=["#1565c0","#6a1b9a","#e65100","#546e7a"])
-                fig5.update_layout(paper_bgcolor="#0e1117", font_color="white", margin=dict(t=20))
-                st.plotly_chart(fig5, use_container_width=True)
-
-    # ─ Tab 3: Upcoming events ──────────────────────────────────────────────────
-    with tab_events:
-        events_df = _load_events()
-        st.subheader("Upcoming Corporate Events (next 60 days)")
-        if events_df.empty:
-            st.info(
-                "No upcoming events found yet. Events are fetched from NSE/BSE "
-                "corporate action APIs and updated with each price refresh."
-            )
-        else:
-            st.dataframe(events_df, use_container_width=True, hide_index=True)
-
-    # ─ Tab 4: Company detail ───────────────────────────────────────────────────
+    # ── Tab 3: Company detail ─────────────────────────────────────────────────
     with tab_detail:
-        st.subheader("Company Deep-Dive")
-        companies = df["Company"].dropna().unique().tolist()
-        if not companies:
-            st.info("No data loaded yet.")
-        else:
-            selected = st.selectbox("Select a company", companies)
-            row = df[df["Company"] == selected].iloc[0] if not df[df["Company"] == selected].empty else None
+        companies = df["Company"].dropna().tolist()
+        sel = st.selectbox("Select a company", companies)
+        row = df[df["Company"] == sel]
+        if not row.empty:
+            r = row.iloc[0]
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Issue Price",    fmt_price(r["Issue ₹"]))
+            c2.metric("Listing Close",  fmt_price(r["List Close ₹"]))
+            c3.metric("Live CMP",       fmt_price(r["CMP ₹"]))
+            c4.metric("Total Gain",     fmt_pct(r["Total Gain %"]))
 
-            if row is not None:
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("Issue Price",   _fmt_price(row.get("Issue Price (₹)")))
-                    st.metric("Listing Price", _fmt_price(row.get("Listing Price (₹)")))
-                    st.metric("CMP",           _fmt_price(row.get("CMP (₹)")))
-                with col2:
-                    st.metric("Listing Gain", row.get("Listing Gain %", "—"))
-                    st.metric("Total Gain",   row.get("Total Gain %", "—"))
-                    st.metric("Day Change",   row.get("Day Chg %", "—"))
-                with col3:
-                    st.metric("52W High", _fmt_price(row.get("52W High (₹)")))
-                    st.metric("52W Low",  _fmt_price(row.get("52W Low (₹)")))
-                    st.metric("Exchange", row.get("Exchange", "—"))
+            c5, c6, c7, c8 = st.columns(4)
+            c5.metric("Listing Gain",   fmt_pct(r["List Gain %"]))
+            c6.metric("Day Change",     fmt_pct(r["Day Chg %"]))
+            c7.metric("52W High",       fmt_price(r["52W High ₹"]))
+            c8.metric("52W Low",        fmt_price(r["52W Low ₹"]))
 
-                st.markdown(f"**Issue Type:** {row.get('Issue Type', '—')}")
-                if row.get("Fresh Issue Size") and row.get("Fresh Issue Size") != "—":
-                    st.markdown(f"**Fresh Issue Size:** {row.get('Fresh Issue Size')}")
-                if row.get("OFS Size") and row.get("OFS Size") != "—":
-                    st.markdown(f"**OFS Size:** {row.get('OFS Size')}")
-                if row.get("Total Issue Size") and row.get("Total Issue Size") != "—":
-                    st.markdown(f"**Total Issue Size:** {row.get('Total Issue Size')}")
+            if r.get("Business"):
+                st.markdown(f"**Business:** {r['Business']}")
+            if r.get("Symbol"):
+                st.markdown(f"**NSE Symbol:** `{r['Symbol']}`")
+                st.markdown(
+                    f"[View on NSE](https://www.nseindia.com/get-quotes/equity?symbol={r['Symbol']}) | "
+                    f"[View on Moneycontrol](https://www.moneycontrol.com/stocks/cptmarket/compsearchnew.php?search_data={r['Company'].replace(' ','+')})"
+                )
 
-                detail_url = row.get("detail_url")
-                if detail_url:
-                    st.markdown(f"[📄 View on Chittorgarh]({detail_url})")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# First-run initialisation modal
-# ─────────────────────────────────────────────────────────────────────────────
-
-def render_first_run():
-    st.title("📈 SME IPO Tracker")
-    st.info(
-        "**First-time setup** — Loading 2–3 years of SME IPO data from Chittorgarh "
-        "and fetching live prices from NSE/BSE. This takes 3–8 minutes (once only). "
-        "Subsequent opens are instant."
+    # ── Auto-refresh (meta tag) ───────────────────────────────────────────────
+    st.markdown(
+        f'<meta http-equiv="refresh" content="{REFRESH_SECS}">',
+        unsafe_allow_html=True,
     )
-    placeholder = st.empty()
-    log_box     = st.empty()
-
-    if st.button("🚀 Start Loading Data", type="primary", use_container_width=True):
-        with st.spinner(""):
-            _run_initial_scrape(placeholder)
-        st.success("Setup complete! Reload the page to view the dashboard.")
-        time.sleep(1)
-        st.rerun()
-
-    # Show log
-    if st.session_state.get("scrape_log"):
-        with log_box.container():
-            st.code("\n".join(st.session_state["scrape_log"]))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Auto-refresh ticker
-# ─────────────────────────────────────────────────────────────────────────────
-
-AUTO_REFRESH_SECS = 300  # 5 minutes
-
-
-def _maybe_auto_refresh(auto_refresh: bool):
-    last = st.session_state.get("prices_fetched_at")
-    if not auto_refresh or not st.session_state.get("initial_scrape_done"):
-        return
-    if last is None or (datetime.now() - last).total_seconds() >= AUTO_REFRESH_SECS:
-        with st.spinner("Auto-refreshing prices …"):
-            _background_price_refresh()
-        st.session_state["refresh_counter"] += 1
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main entry point
-# ─────────────────────────────────────────────────────────────────────────────
-
-def main():
-    # Consider setup done only if we have a meaningful number of IPOs,
-    # or the user explicitly completed the setup in this session.
-    n = db.count_ipos()
-    initial_done = n >= 10 or st.session_state.get("initial_scrape_done", False)
-
-    if not initial_done:
-        render_first_run()
-        return
-
-    st.session_state["initial_scrape_done"] = True
-    filters = render_sidebar()
-
-    # Auto-refresh check
-    _maybe_auto_refresh(filters.get("auto_refresh", True))
-
-    # Header
-    last_refresh = st.session_state.get("prices_fetched_at")
-    last_str = last_refresh.strftime("%d %b %Y %H:%M") if last_refresh else "—"
-    st.title("📈 SME IPO Tracker")
-    st.caption(
-        f"NSE Emerge + BSE SME | Real-time prices via NSE/BSE APIs | "
-        f"Last price update: {last_str} | "
-        f"Auto-refreshes every 5 minutes"
-    )
-
-    # Load data
-    df = _load_combined()
-    render_dashboard(df, filters)
-
-    # Schedule next auto-refresh via a meta-refresh trick
-    if filters.get("auto_refresh"):
-        countdown = AUTO_REFRESH_SECS
-        if last_refresh:
-            elapsed = (datetime.now() - last_refresh).total_seconds()
-            countdown = max(30, int(AUTO_REFRESH_SECS - elapsed))
-        st.markdown(
-            f"""<meta http-equiv="refresh" content="{countdown}">""",
-            unsafe_allow_html=True,
-        )
-        st.caption(f"⏱️ Next auto-refresh in ~{countdown//60}m {countdown%60}s")
+    st.caption(f"⏱ Next auto-refresh in ~5 min")
 
 
 if __name__ == "__main__":
