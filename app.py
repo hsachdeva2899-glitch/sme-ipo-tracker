@@ -325,6 +325,18 @@ def render_sidebar():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def render_dashboard(df: pd.DataFrame, filters: dict):
+    # Guard: if df has no columns (DB empty / cold start), show setup prompt
+    if df.empty or "Exchange" not in df.columns:
+        st.info(
+            "📭 No data loaded yet.\n\n"
+            "Click **'Start Loading Data'** in the sidebar to scrape IPO data "
+            "and fetch live prices. This takes ~5–10 minutes the first time."
+        )
+        if st.button("🚀 Start Loading Data", type="primary"):
+            st.session_state["initial_scrape_done"] = False
+            st.rerun()
+        return
+
     # ── Apply filters ─────────────────────────────────────────────────────────
     if filters["exchanges"]:
         df = df[df["Exchange"].isin(filters["exchanges"])]
@@ -627,9 +639,10 @@ def _maybe_auto_refresh(auto_refresh: bool):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    # Check if we have data in DB
+    # Consider setup done only if we have a meaningful number of IPOs,
+    # or the user explicitly completed the setup in this session.
     n = db.count_ipos()
-    initial_done = n > 0 or st.session_state.get("initial_scrape_done", False)
+    initial_done = n >= 10 or st.session_state.get("initial_scrape_done", False)
 
     if not initial_done:
         render_first_run()
